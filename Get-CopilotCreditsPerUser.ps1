@@ -9,13 +9,32 @@
 
     Scope is selected by the target parameter you pass:
       -Org <name>          Every user with a Copilot seat in the organization.
-      -Enterprise <slug>   Every user with a Copilot seat in the enterprise.
-      -Self                Only the authenticated user's personal Copilot usage.
+      -Enterprise <slug>   Users billed to an enterprise (pass -Users or -Organizations).
+      -Self                Only the authenticated user's own personal Copilot usage.
+
+    Billing endpoints (https://docs.github.com/en/rest/billing/usage):
+      Org   GET /organizations/{org}/settings/billing/ai_credit/usage?user=...
+      Ent   GET /enterprises/{ent}/settings/billing/ai_credit/usage?user=...
+      User  GET /users/{username}/settings/billing/ai_credit/usage   (path-scoped)
+
+.NOTES
+    Access required:
+      -Org         organization owner or billing manager
+      -Enterprise  enterprise admin or billing manager
+      -Self        the "user" OAuth scope (gh auth refresh -h github.com -s user)
+
+    Enterprise-managed users: a user whose Copilot is billed by an org or enterprise
+    will NOT see usage on their personal (-Self) account - it is billed to the owning
+    org/enterprise. Query that scope instead (requires billing access there).
+
+    GitHub exposes no enterprise-wide Copilot seats endpoint, so -Enterprise needs
+    either -Users (explicit logins) or -Organizations (member orgs to enumerate).
 
 .EXAMPLE
     ./Get-CopilotCreditsPerUser.ps1 -Org my-org
-    ./Get-CopilotCreditsPerUser.ps1 -Enterprise my-ent -Year 2026 -Month 6 -CsvPath .\ent-june.csv
     ./Get-CopilotCreditsPerUser.ps1 -Org my-org -Users alice,bob
+    ./Get-CopilotCreditsPerUser.ps1 -Enterprise my-ent -Users alice,bob
+    ./Get-CopilotCreditsPerUser.ps1 -Enterprise my-ent -Organizations team-a,team-b -Month 6
     ./Get-CopilotCreditsPerUser.ps1 -Self
 #>
 [CmdletBinding(DefaultParameterSetName = 'Org')]
@@ -36,11 +55,15 @@ param(
     [Parameter(ParameterSetName = 'Enterprise')]
     [string[]]$Users,
 
+    [Parameter(ParameterSetName = 'Enterprise')]
+    [string[]]$Organizations,
+
     [string]$CsvPath
 )
 
 $ErrorActionPreference = 'Stop'
-$apiVersion = '2022-11-28'
+$apiVersion   = '2022-11-28'
+$script:failed = 0
 
 function Invoke-GH([string]$Path) {
     # Localize so a non-zero gh exit doesn't get auto-thrown before we inspect it.
@@ -64,7 +87,19 @@ function Invoke-GH([string]$Path) {
     }
 }
 
-# Summarize a usageItems array into net USD + the distinct models seen.
+# Emit the Copilot seat logins for an org (paginated). Wrap calls in @() to keep an array.
+function Get-OrgSeatLogins([string]$OrgName) {
+    $page = 1
+    while ($true) {
+        $resp = Invoke-GH "/orgs/$OrgName/copilot/billing/seats?per_page=100&page=$page"
+        if (-not $resp -or -not $resp.seats -or $resp.seats.Count -eq 0) { break }
+        $resp.seats.assignee.login
+        if ($resp.seats.Count -lt 100) { break }
+        $page++
+    }
+}
+
+# Net USD + distinct models from a usageItems array.
 function Get-UsageSummary($items) {
     if (-not $items) { $items = @() }
     $netUsd = ($items | Measure-Object -Property netAmount -Sum).Sum
@@ -83,68 +118,66 @@ function New-Row($user, $summary) {
     }
 }
 
-# Resolve scope -> billing base path, seats path, and a label.
-switch ($PSCmdlet.ParameterSetName) {
-    'Org' {
-        $billingBase = "/organizations/$Org/settings/billing/ai_credit/usage"
-        $seatsPath   = "/orgs/$Org/copilot/billing/seats"
-        $scopeLabel  = "org '$Org'"
-    }
-    'Enterprise' {
-        $billingBase = "/enterprises/$Enterprise/settings/billing/ai_credit/usage"
-        $seatsPath   = "/enterprises/$Enterprise/copilot/billing/seats"
-        $scopeLabel  = "enterprise '$Enterprise'"
-    }
-    'Self' {
-        $me          = (Invoke-GH "/user").login
-        $billingBase = "/users/$me/settings/billing/ai_credit/usage"
-        $scopeLabel  = "personal account '$me'"
-    }
-}
-
-$failed = 0
-
-if ($PSCmdlet.ParameterSetName -eq 'Self') {
-    # One call, one row - the personal endpoint is already user-scoped by path.
-    Write-Host ("Fetching {0} usage for {1}-{2:D2}..." -f $scopeLabel, $Year, $Month) -ForegroundColor Cyan
-    $usage = Invoke-GH ("{0}?year={1}&month={2}" -f $billingBase, $Year, $Month)
-    $rows  = ,(New-Row $me (Get-UsageSummary $usage.usageItems))
-}
-else {
-    # Org / Enterprise: resolve the user list (explicit -Users, else current seats), then loop.
-    if (-not $Users) {
-        Write-Host "Listing current Copilot seats for $scopeLabel (for closed months, pass -Users to include anyone who has since lost their seat)..." -ForegroundColor Cyan
+# Loop a set of users against a billing base path; failures are reported and excluded.
+function Get-PerUserRows([string]$BillingBase, [string[]]$UserList) {
+    foreach ($u in $UserList) {
         try {
-            $Users = @()
-            $page = 1
-            while ($true) {
-                $resp = Invoke-GH "${seatsPath}?per_page=100&page=$page"
-                if (-not $resp -or -not $resp.seats -or $resp.seats.Count -eq 0) { break }
-                $Users += $resp.seats.assignee.login
-                if ($resp.seats.Count -lt 100) { break }
-                $page++
-            }
-        }
-        catch {
-            $first = ($_.Exception.Message -split "`n")[0]
-            throw "Could not list Copilot seats for $scopeLabel ($first). Re-run with -Users to specify accounts explicitly."
-        }
-    }
-    $Users = $Users | Where-Object { $_ } | Sort-Object -Unique
-    if (-not $Users) { throw "No Copilot users found for $scopeLabel. Pass -Users explicitly or check access." }
-    Write-Host ("Aggregating {0} users for {1}-{2:D2}..." -f $Users.Count, $Year, $Month) -ForegroundColor Cyan
-
-    $rows = foreach ($u in $Users) {
-        try {
-            $usage = Invoke-GH ("{0}?user={1}&year={2}&month={3}" -f $billingBase, $u, $Year, $Month)
+            $usage = Invoke-GH ("{0}?user={1}&year={2}&month={3}" -f $BillingBase, $u, $Year, $Month)
         }
         catch {
             Write-Warning "Usage lookup failed for '$u' - excluded from totals: $(($_.Exception.Message -split "`n")[0])"
-            $failed++
+            $script:failed++
             [pscustomobject]@{ User = $u; Models = '(lookup failed)'; NetUSD = $null; AICredits = $null }
             continue
         }
         New-Row $u (Get-UsageSummary $usage.usageItems)
+    }
+}
+
+switch ($PSCmdlet.ParameterSetName) {
+
+    'Self' {
+        $me = (Invoke-GH "/user").login
+        Write-Host ("Fetching personal usage for '{0}' ({1}-{2:D2})..." -f $me, $Year, $Month) -ForegroundColor Cyan
+        $usage   = Invoke-GH ("/users/{0}/settings/billing/ai_credit/usage?year={1}&month={2}" -f $me, $Year, $Month)
+        $rows    = ,(New-Row $me (Get-UsageSummary $usage.usageItems))
+        if (-not $usage.usageItems -or $usage.usageItems.Count -eq 0) {
+            Write-Warning ("No personal Copilot usage for '{0}'. If your Copilot is managed/billed by an organization or enterprise, usage is billed there - not on your personal account. Ask a billing manager to run:  -Org <org> -Users {0}   or   -Enterprise <slug> -Users {0}" -f $me)
+        }
+    }
+
+    'Org' {
+        if (-not $Users) {
+            Write-Host "Listing current Copilot seats for org '$Org' (for closed months, pass -Users to include anyone who has since lost their seat)..." -ForegroundColor Cyan
+            try { $Users = @(Get-OrgSeatLogins $Org) }
+            catch {
+                throw "Could not list Copilot seats for org '$Org' ($(($_.Exception.Message -split "`n")[0])). Re-run with -Users to specify accounts explicitly."
+            }
+        }
+        $Users = $Users | Where-Object { $_ } | Sort-Object -Unique
+        if (-not $Users) { throw "No Copilot users found for org '$Org'. Pass -Users explicitly or check access." }
+        Write-Host ("Aggregating {0} users for {1}-{2:D2}..." -f $Users.Count, $Year, $Month) -ForegroundColor Cyan
+        $rows = Get-PerUserRows "/organizations/$Org/settings/billing/ai_credit/usage" $Users
+    }
+
+    'Enterprise' {
+        # No enterprise-wide seats endpoint exists: resolve users from -Users or per-org -Organizations.
+        if (-not $Users) {
+            if ($Organizations) {
+                Write-Host ("Enumerating Copilot seats across {0} org(s) for enterprise '{1}'..." -f $Organizations.Count, $Enterprise) -ForegroundColor Cyan
+                $Users = @(foreach ($o in $Organizations) {
+                    try { Get-OrgSeatLogins $o }
+                    catch { Write-Warning "Could not list seats for org '$o': $(($_.Exception.Message -split "`n")[0])" }
+                })
+            }
+            else {
+                throw "Enterprise mode needs -Users <logins> or -Organizations <orgs>. GitHub exposes no enterprise-wide Copilot seats endpoint, so accounts must be supplied or gathered per organization."
+            }
+        }
+        $Users = $Users | Where-Object { $_ } | Sort-Object -Unique
+        if (-not $Users) { throw "No Copilot users resolved for enterprise '$Enterprise'. Pass -Users or check -Organizations access." }
+        Write-Host ("Aggregating {0} users for {1}-{2:D2}..." -f $Users.Count, $Year, $Month) -ForegroundColor Cyan
+        $rows = Get-PerUserRows "/enterprises/$Enterprise/settings/billing/ai_credit/usage" $Users
     }
 }
 
@@ -156,7 +189,7 @@ $ok     = $rows | Where-Object { $null -ne $_.NetUSD }
 $totUsd = ($ok | Measure-Object NetUSD -Sum).Sum;    if (-not $totUsd) { $totUsd = 0 }
 $totCr  = ($ok | Measure-Object AICredits -Sum).Sum; if (-not $totCr)  { $totCr  = 0 }
 Write-Host ('TOTAL  net ${0:N2} USD  =  {1:N0} AI credits   ({2}-{3:D2})' -f $totUsd, $totCr, $Year, $Month) -ForegroundColor Green
-if ($failed) { Write-Warning "$failed user(s) failed to fetch and are excluded from the total." }
+if ($script:failed) { Write-Warning "$($script:failed) user(s) failed to fetch and are excluded from the total." }
 Write-Host "Note: amounts are USD (1 credit = `$0.01); verified against the billing schema grossAmount = grossQuantity x pricePerUnit." -ForegroundColor DarkGray
 
 if ($CsvPath) {

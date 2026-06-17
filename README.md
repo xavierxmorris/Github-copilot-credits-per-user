@@ -29,10 +29,30 @@ TOTAL  net $53.25 USD  =  5,325 AI credits   (2026-06)
 
 - [GitHub CLI](https://cli.github.com/) (`gh`), authenticated: `gh auth login`
 - PowerShell 5.1+ (Windows PowerShell or PowerShell 7+)
-- Billing access at the scope you query:
-  - **Org**: organization owner or billing manager
-  - **Enterprise**: enterprise admin or billing manager
-  - **Self**: the authenticated user (needs the `user` OAuth scope — run `gh auth refresh -h github.com -s user` once)
+- Billing access at the scope you query (see below)
+
+## Scope & access — pick exactly one target
+
+| Parameter      | Scope        | Who can run it                       | Billing endpoint |
+| -------------- | ------------ | ------------------------------------ | ---------------- |
+| `-Org`         | Organization | Org owner / billing manager          | `/organizations/{org}/settings/billing/ai_credit/usage` |
+| `-Enterprise`  | Enterprise   | Enterprise admin / billing manager   | `/enterprises/{ent}/settings/billing/ai_credit/usage` |
+| `-Self`        | Personal     | The authenticated user (`user` scope)| `/users/{me}/settings/billing/ai_credit/usage` |
+
+For `-Self`, grant the scope once: `gh auth refresh -h github.com -s user`.
+
+### Personal vs. enterprise-managed users — important
+
+A user's Copilot usage is visible **only at the scope that pays for their seat**:
+
+- **Personal plan** (the user bought their own Copilot): use `-Self`, or `-Org/-Enterprise -Users <login>` is *not* applicable — their usage lives on `/users/{login}/...`.
+- **Enterprise-managed / org-managed** (the seat is billed by an org or enterprise): the user's usage does **not** appear on their personal `-Self` account. It is billed to the owning org/enterprise, so query that scope with billing access:
+  - `-Org <org> -Users <login>`
+  - `-Enterprise <slug> -Users <login>`
+
+If you run `-Self` and get `$0` with a warning, your seat is almost certainly managed by an org/enterprise — ask a billing manager there to run the org/enterprise query.
+
+> **Note:** GitHub exposes **no enterprise-wide Copilot seats endpoint** (only `/orgs/{org}/copilot/billing/seats`). So `-Enterprise` requires either `-Users` (explicit logins) or `-Organizations` (member orgs whose seats are enumerated).
 
 ## Usage
 
@@ -40,49 +60,47 @@ TOTAL  net $53.25 USD  =  5,325 AI credits   (2026-06)
 # Organization: every current Copilot seat, this month
 ./Get-CopilotCreditsPerUser.ps1 -Org my-org
 
-# Enterprise: a specific month, exported to CSV
-./Get-CopilotCreditsPerUser.ps1 -Enterprise my-ent -Year 2026 -Month 6 -CsvPath .\ent-june.csv
+# Organization: specific users, exported to CSV
+./Get-CopilotCreditsPerUser.ps1 -Org my-org -Users alice,bob -CsvPath .\june.csv
 
-# Specific users only (skips seat enumeration; use for closed months or enterprises)
-./Get-CopilotCreditsPerUser.ps1 -Org my-org -Users alice,bob
+# Enterprise: explicit users
+./Get-CopilotCreditsPerUser.ps1 -Enterprise my-ent -Users alice,bob -Year 2026 -Month 6
 
-# Personal: just the authenticated user's own Copilot usage
+# Enterprise: enumerate seats across member orgs, then bill via the enterprise endpoint
+./Get-CopilotCreditsPerUser.ps1 -Enterprise my-ent -Organizations team-a,team-b
+
+# Personal: the authenticated user's own Copilot usage
 ./Get-CopilotCreditsPerUser.ps1 -Self
 ```
 
-### Scope (choose exactly one)
+### Parameters
 
-| Parameter      | Scope        | Notes                                                       |
-| -------------- | ------------ | ----------------------------------------------------------- |
-| `-Org`         | Organization | Aggregates every user with a Copilot seat in the org        |
-| `-Enterprise`  | Enterprise   | Aggregates every user with a Copilot seat in the enterprise |
-| `-Self`        | Personal     | Only the authenticated user's personal Copilot usage        |
-
-### Common parameters
-
-| Parameter  | Default       | Notes                                                                  |
-| ---------- | ------------- | ---------------------------------------------------------------------- |
-| `-Year`    | current year  | Four-digit year                                                        |
-| `-Month`   | current month | 1–12                                                                   |
-| `-Users`   | (auto)        | Explicit list (Org/Enterprise only); otherwise current seats are used  |
-| `-CsvPath` | —             | If set, writes the table to CSV                                        |
+| Parameter        | Applies to        | Default       | Notes                                                             |
+| ---------------- | ----------------- | ------------- | ----------------------------------------------------------------- |
+| `-Org`           | Org scope         | —             | Organization login                                                |
+| `-Enterprise`    | Enterprise scope  | —             | Enterprise **slug**                                               |
+| `-Self`          | Personal scope    | —             | Authenticated user's own usage                                    |
+| `-Year`          | all               | current year  | Four-digit year                                                   |
+| `-Month`         | all               | current month | 1–12                                                              |
+| `-Users`         | Org, Enterprise   | (auto for Org)| Explicit logins; required for Enterprise unless `-Organizations`  |
+| `-Organizations` | Enterprise        | —             | Member orgs whose Copilot seats are enumerated                    |
+| `-CsvPath`       | all               | —             | If set, writes the table to CSV                                   |
 
 ## How it works
 
-1. Resolves the user list from the seats endpoint (`/orgs/{org}/copilot/billing/seats` or `/enterprises/{ent}/copilot/billing/seats`), or uses `-Users`. `-Self` skips this — the personal endpoint is already user-scoped.
-2. For each user, calls the AI-credit usage endpoint for the chosen scope and sums `netAmount` across every line item (all models):
-   - Org: `/organizations/{org}/settings/billing/ai_credit/usage?user=…&year=…&month=…`
-   - Enterprise: `/enterprises/{ent}/settings/billing/ai_credit/usage?user=…&year=…&month=…`
-   - Self: `/users/{me}/settings/billing/ai_credit/usage?year=…&month=…`
-3. Converts to credits (`USD x 100`) and prints a per-user table + total.
+1. **Resolve users.**
+   - `-Org`: list seats via `/orgs/{org}/copilot/billing/seats` (or `-Users`).
+   - `-Enterprise`: from `-Users`, or enumerate seats of each `-Organizations` member org.
+   - `-Self`: skipped — the personal endpoint is already user-scoped.
+2. **Fetch usage** per user from the scope's `ai_credit/usage` endpoint and sum `netAmount` across every line item (all models).
+3. **Convert** to credits (`USD x 100`) and print a per-user table + total.
 
 Failed lookups are reported and **excluded** from the total (never silently counted as `$0`), with a final failure count.
 
 ## Notes & caveats
 
-- **USD denomination (verified).** Billing line items satisfy `grossAmount = grossQuantity × pricePerUnit`, amounts are in USD, and `unitType` is the native unit (tokens, minutes, etc.). So `AICredits = NetUSD × 100` is correct. (Confirmed against live billing data.)
-- **Current seats only.** Auto-discovery finds users who hold a Copilot seat *now*. For a closed month, pass `-Users` to include anyone who has since lost their seat.
-- **Query at the billing owner's scope.** If a user's Copilot license is managed and billed by an org or enterprise, their usage appears only at *that* scope — not on their personal (`-Self`) account. Run the script against the scope that actually pays for the seat.
+- **USD denomination (verified live).** Billing line items satisfy `grossAmount = grossQuantity × pricePerUnit`, amounts are in USD, and `unitType` is the native unit (tokens, minutes, etc.). So `AICredits = NetUSD × 100` is correct.
+- **Current seats only.** Auto-discovery (Org / Enterprise `-Organizations`) finds users who hold a Copilot seat *now*. For a closed month, pass `-Users` to include anyone who has since lost their seat.
 - **No raw token counts.** The billing API exposes AI credits / dollars, not token counts. Tokens are converted to credits before they reach the API, so per-user token totals are not recoverable from billing data alone.
 
 ## License
