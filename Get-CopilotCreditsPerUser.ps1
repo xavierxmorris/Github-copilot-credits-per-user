@@ -17,6 +17,10 @@
       Ent   GET /enterprises/{ent}/settings/billing/ai_credit/usage?user=...
       User  GET /users/{username}/settings/billing/ai_credit/usage   (path-scoped)
 
+    For Org/Enterprise auto-discovery, the per-user total is reconciled against the
+    scope aggregate (same call without ?user=) to surface any unattributed usage,
+    e.g. from users who lost their seat mid-month.
+
 .NOTES
     Access required:
       -Org         organization owner or billing manager
@@ -27,12 +31,16 @@
     will NOT see usage on their personal (-Self) account - it is billed to the owning
     org/enterprise. Query that scope instead (requires billing access there).
 
-    GitHub exposes no enterprise-wide Copilot seats endpoint, so -Enterprise needs
-    either -Users (explicit logins) or -Organizations (member orgs to enumerate).
+    GitHub exposes no enterprise-wide Copilot seats endpoint, so -Organizations is a
+    user-DISCOVERY source: it lists each named org's seats, then the enterprise usage
+    endpoint reports each resolved user's full enterprise usage (not org-scoped).
+
+    The usage endpoints document no page/per_page params and return an aggregate
+    report, so usageItems are treated as a single non-paginated set.
 
 .EXAMPLE
     ./Get-CopilotCreditsPerUser.ps1 -Org my-org
-    ./Get-CopilotCreditsPerUser.ps1 -Org my-org -Users alice,bob
+    ./Get-CopilotCreditsPerUser.ps1 -Org my-org -Users alice,bob -CsvPath .\june.csv
     ./Get-CopilotCreditsPerUser.ps1 -Enterprise my-ent -Users alice,bob
     ./Get-CopilotCreditsPerUser.ps1 -Enterprise my-ent -Organizations team-a,team-b -Month 6
     ./Get-CopilotCreditsPerUser.ps1 -Self
@@ -58,12 +66,16 @@ param(
     [Parameter(ParameterSetName = 'Enterprise')]
     [string[]]$Organizations,
 
+    [string]$Product,
+
     [string]$CsvPath
 )
 
 $ErrorActionPreference = 'Stop'
-$apiVersion   = '2022-11-28'
-$script:failed = 0
+$apiVersion        = '2022-11-28'
+$script:failed     = 0
+$script:perUserRaw = 0.0
+$productQ          = if ($Product) { "&product=$Product" } else { "" }
 
 function Invoke-GH([string]$Path) {
     # Localize so a non-zero gh exit doesn't get auto-thrown before we inspect it.
@@ -122,7 +134,7 @@ function New-Row($user, $summary) {
 function Get-PerUserRows([string]$BillingBase, [string[]]$UserList) {
     foreach ($u in $UserList) {
         try {
-            $usage = Invoke-GH ("{0}?user={1}&year={2}&month={3}" -f $BillingBase, $u, $Year, $Month)
+            $usage = Invoke-GH ("{0}?user={1}&year={2}&month={3}{4}" -f $BillingBase, $u, $Year, $Month, $productQ)
         }
         catch {
             Write-Warning "Usage lookup failed for '$u' - excluded from totals: $(($_.Exception.Message -split "`n")[0])"
@@ -130,24 +142,31 @@ function Get-PerUserRows([string]$BillingBase, [string[]]$UserList) {
             [pscustomobject]@{ User = $u; Models = '(lookup failed)'; NetUSD = $null; AICredits = $null }
             continue
         }
-        New-Row $u (Get-UsageSummary $usage.usageItems)
+        $summary = Get-UsageSummary $usage.usageItems
+        $script:perUserRaw += [double]$summary.NetUsd
+        New-Row $u $summary
     }
 }
+
+$billingBase    = $null
+$autoDiscovered = $false
 
 switch ($PSCmdlet.ParameterSetName) {
 
     'Self' {
         $me = (Invoke-GH "/user").login
         Write-Host ("Fetching personal usage for '{0}' ({1}-{2:D2})..." -f $me, $Year, $Month) -ForegroundColor Cyan
-        $usage   = Invoke-GH ("/users/{0}/settings/billing/ai_credit/usage?year={1}&month={2}" -f $me, $Year, $Month)
-        $rows    = ,(New-Row $me (Get-UsageSummary $usage.usageItems))
+        $usage = Invoke-GH ("/users/{0}/settings/billing/ai_credit/usage?year={1}&month={2}{3}" -f $me, $Year, $Month, $productQ)
+        $rows  = ,(New-Row $me (Get-UsageSummary $usage.usageItems))
         if (-not $usage.usageItems -or $usage.usageItems.Count -eq 0) {
             Write-Warning ("No personal Copilot usage for '{0}'. If your Copilot is managed/billed by an organization or enterprise, usage is billed there - not on your personal account. Ask a billing manager to run:  -Org <org> -Users {0}   or   -Enterprise <slug> -Users {0}" -f $me)
         }
     }
 
     'Org' {
+        $billingBase = "/organizations/$Org/settings/billing/ai_credit/usage"
         if (-not $Users) {
+            $autoDiscovered = $true
             Write-Host "Listing current Copilot seats for org '$Org' (for closed months, pass -Users to include anyone who has since lost their seat)..." -ForegroundColor Cyan
             try { $Users = @(Get-OrgSeatLogins $Org) }
             catch {
@@ -157,13 +176,14 @@ switch ($PSCmdlet.ParameterSetName) {
         $Users = $Users | Where-Object { $_ } | Sort-Object -Unique
         if (-not $Users) { throw "No Copilot users found for org '$Org'. Pass -Users explicitly or check access." }
         Write-Host ("Aggregating {0} users for {1}-{2:D2}..." -f $Users.Count, $Year, $Month) -ForegroundColor Cyan
-        $rows = Get-PerUserRows "/organizations/$Org/settings/billing/ai_credit/usage" $Users
+        $rows = Get-PerUserRows $billingBase $Users
     }
 
     'Enterprise' {
-        # No enterprise-wide seats endpoint exists: resolve users from -Users or per-org -Organizations.
+        $billingBase = "/enterprises/$Enterprise/settings/billing/ai_credit/usage"
         if (-not $Users) {
             if ($Organizations) {
+                $autoDiscovered = $true
                 Write-Host ("Enumerating Copilot seats across {0} org(s) for enterprise '{1}'..." -f $Organizations.Count, $Enterprise) -ForegroundColor Cyan
                 $Users = @(foreach ($o in $Organizations) {
                     try { Get-OrgSeatLogins $o }
@@ -177,7 +197,7 @@ switch ($PSCmdlet.ParameterSetName) {
         $Users = $Users | Where-Object { $_ } | Sort-Object -Unique
         if (-not $Users) { throw "No Copilot users resolved for enterprise '$Enterprise'. Pass -Users or check -Organizations access." }
         Write-Host ("Aggregating {0} users for {1}-{2:D2}..." -f $Users.Count, $Year, $Month) -ForegroundColor Cyan
-        $rows = Get-PerUserRows "/enterprises/$Enterprise/settings/billing/ai_credit/usage" $Users
+        $rows = Get-PerUserRows $billingBase $Users
     }
 }
 
@@ -190,6 +210,25 @@ $totUsd = ($ok | Measure-Object NetUSD -Sum).Sum;    if (-not $totUsd) { $totUsd
 $totCr  = ($ok | Measure-Object AICredits -Sum).Sum; if (-not $totCr)  { $totCr  = 0 }
 Write-Host ('TOTAL  net ${0:N2} USD  =  {1:N0} AI credits   ({2}-{3:D2})' -f $totUsd, $totCr, $Year, $Month) -ForegroundColor Green
 if ($script:failed) { Write-Warning "$($script:failed) user(s) failed to fetch and are excluded from the total." }
+
+# Reconcile per-user sum against the scope aggregate (Org/Enterprise only) to catch
+# usage not attributed to the queried users (e.g. seats removed mid-month).
+if ($billingBase) {
+    try {
+        $scope    = Invoke-GH ("{0}?year={1}&month={2}{3}" -f $billingBase, $Year, $Month, $productQ)
+        $scopeNet = ($scope.usageItems | Measure-Object -Property netAmount -Sum).Sum
+        if (-not $scopeNet) { $scopeNet = 0 }
+        $gap = [math]::Round($scopeNet - $script:perUserRaw, 2)
+        Write-Host ('Reconcile: scope total ${0:N2} USD; attributed to queried users ${1:N2} USD; unattributed ${2:N2} USD' -f $scopeNet, $script:perUserRaw, $gap) -ForegroundColor DarkGray
+        if ($autoDiscovered -and $gap -gt 0.005) {
+            Write-Warning ("`${0:N2} USD of scope usage is not attributed to the discovered users (e.g. accounts without a current seat, or orgs not in -Organizations). Pass -Users for a complete monthly list." -f $gap)
+        }
+    }
+    catch {
+        Write-Warning "Reconciliation skipped: $(($_.Exception.Message -split "`n")[0])"
+    }
+}
+
 Write-Host "Note: amounts are USD (1 credit = `$0.01); verified against the billing schema grossAmount = grossQuantity x pricePerUnit." -ForegroundColor DarkGray
 
 if ($CsvPath) {
